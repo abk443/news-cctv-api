@@ -1,4 +1,3 @@
-
 """
 新闻联播 API (轻量版) - 无需 AkShare/pandas，直接爬取央视官网
 适合部署到 Render / Vercel / Railway 等免费平台
@@ -12,7 +11,10 @@
 """
 
 import io
+import os
 import re
+import tempfile
+import urllib.request
 from datetime import datetime
 from typing import Optional
 
@@ -32,21 +34,83 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
-# 字体路径（Docker 环境安装的 Noto CJK）
-import os
-FONT_REGULAR = os.environ.get("FONT_REGULAR", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")
-FONT_BOLD = os.environ.get("FONT_BOLD", "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc")
-# Vercel 环境：bundled font
-if not os.path.exists(FONT_REGULAR):
-    FONT_REGULAR = os.path.join(os.path.dirname(__file__), "fonts", "NotoSansSC-Regular.otf")
-    FONT_BOLD = os.path.join(os.path.dirname(__file__), "fonts", "NotoSansSC-Bold.otf")
+
+# ─── 字体：自动检测系统字体，找不到则从 CDN 下载 ───
+_FONT_DIR = os.path.join(tempfile.gettempdir(), "cctv_fonts")
+os.makedirs(_FONT_DIR, exist_ok=True)
+
+def _find_system_font():
+    """在系统中搜索可用的中文字体"""
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansSC-Bold.otf",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    # glob 搜索
+    import glob
+    for pattern in ["/usr/share/fonts/**/*NotoSans*CJK*", "/usr/share/fonts/**/*NotoSans*SC*"]:
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            return matches[0]
+    return None
+
+def _download_font(name: str) -> str:
+    """从 CDN 下载中文字体到临时目录"""
+    target = os.path.join(_FONT_DIR, name)
+    if os.path.exists(target):
+        return target
+    urls = [
+        f"https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/SubsetOTF/SC/{name}",
+        f"https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/SubsetOTF/SC/{name}",
+    ]
+    for url in urls:
+        try:
+            print(f"[font] 下载 {name} from {url} ...")
+            urllib.request.urlretrieve(url, target)
+            if os.path.getsize(target) > 100000:
+                print(f"[font] {name} 下载成功 ({os.path.getsize(target)/1024/1024:.1f} MB)")
+                return target
+            else:
+                os.remove(target)
+        except Exception as e:
+            print(f"[font] 下载失败: {e}")
+    return None
+
+def _init_fonts():
+    """初始化字体路径：优先系统字体，其次下载"""
+    regular = _find_system_font()
+    if regular:
+        bold_path = regular.replace("Regular", "Bold")
+        if not os.path.exists(bold_path):
+            bold_path = regular
+        return regular, bold_path
+    # 系统无中文字体，从 CDN 下载
+    regular = _download_font("NotoSansSC-Regular.otf")
+    bold = _download_font("NotoSansSC-Bold.otf")
+    if regular and not bold:
+        bold = regular
+    return regular, bold
+
+FONT_REGULAR, FONT_BOLD = _init_fonts()
+if FONT_REGULAR:
+    print(f"[font] 使用字体: {FONT_REGULAR}")
+else:
+    print("[font] WARNING: 未找到中文字体，图片将无法正常显示中文！")
 
 
 def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        return ImageFont.load_default()
+    if path and os.path.exists(path):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
 
 
 # ─── 缓存 ───
@@ -125,11 +189,29 @@ def fetch_news(date_str: str) -> list[dict]:
     return news_list
 
 
+# ─── 摘要提取 ───
+def _summarize(content: str, max_len: int = 60) -> str:
+    """将长正文压缩为一句话摘要"""
+    text = content.strip().replace("\n", " ")
+    # 按句号分割，取前 1-2 句
+    sentences = re.split(r'[。！？；]', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if sentences:
+        summary = sentences[0]
+        if len(summary) < 25 and len(sentences) > 1:
+            summary += "。" + sentences[1]
+    else:
+        summary = text
+    if len(summary) > max_len:
+        summary = summary[:max_len] + "…"
+    return summary
+
+
 # ─── 图片生成 ───
 def render_image(date_str: str, news_list: list[dict]) -> bytes:
     width = 800
     padding = 40
-    max_chars = 36
+    max_chars = 34  # 摘要换行宽度
 
     try:
         dt = datetime.strptime(date_str, "%Y%m%d")
@@ -140,65 +222,74 @@ def render_image(date_str: str, news_list: list[dict]) -> bytes:
         date_display = date_str
         weekday = ""
 
-    # 计算高度
-    height = 120
+    # 预处理：每条新闻只取摘要
+    summaries = []
     for item in news_list:
-        height += 30
-        content = item["content"]
-        lines = []
-        for line in content.split("\n"):
-            while len(line) > max_chars:
-                lines.append(line[:max_chars])
-                line = line[max_chars:]
-            lines.append(line)
-        height += (len(lines) if lines else 1) * (22 + 8)
-        height += 25
+        title = item["title"]
+        summary = _summarize(item["content"], max_len=55)
+        summaries.append((title, summary))
 
-    height += 40
+    # 计算高度
+    line_h = 24
+    gap = 12
+    height = 110  # 标题栏 + 间距
+    for title, summary in summaries:
+        height += 28  # 标题行
+        # 摘要换行
+        s = summary
+        s_lines = []
+        while len(s) > max_chars:
+            s_lines.append(s[:max_chars])
+            s = s[max_chars:]
+        s_lines.append(s)
+        height += len(s_lines) * line_h + gap
+
+    height += 50  # 底部
 
     img = Image.new("RGB", (width, max(height, 200)), "#FFFFFF")
     draw = ImageDraw.Draw(img)
 
-    # 标题栏
+    # 字体
     title_font = _font(FONT_BOLD, 28)
     date_font = _font(FONT_REGULAR, 16)
-    item_font = _font(FONT_BOLD, 18)
+    item_font = _font(FONT_BOLD, 17)
     body_font = _font(FONT_REGULAR, 15)
     footer_font = _font(FONT_REGULAR, 12)
 
+    # 标题栏
     draw.rectangle([0, 0, width, 80], fill="#C41E3A")
     draw.text((padding, 18), "新闻联播", font=title_font, fill="#FFFFFF")
     draw.text((padding + 160, 28), date_display, font=date_font, fill="#FFD700")
     draw.text((padding + 320, 28), weekday, font=date_font, fill="#FFD700")
 
-    y = 100
-    for i, item in enumerate(news_list, 1):
-        draw.text((padding, y), f"{i}. {item['title']}", font=item_font, fill="#1A1A1A")
-        y += 30
+    y = 95
+    for i, (title, summary) in enumerate(summaries, 1):
+        # 序号 + 标题
+        draw.text((padding, y), f"{i}. {title}", font=item_font, fill="#1A1A1A")
+        y += 28
 
-        content = item["content"]
-        lines = []
-        for line in content.split("\n"):
-            while len(line) > max_chars:
-                lines.append(line[:max_chars])
-                line = line[max_chars:]
-            lines.append(line)
+        # 摘要（灰色，缩进）
+        s = summary
+        s_lines = []
+        while len(s) > max_chars:
+            s_lines.append(s[:max_chars])
+            s = s[max_chars:]
+        s_lines.append(s)
 
-        if not lines:
-            lines = [""]
+        for sl in s_lines:
+            draw.text((padding + 20, y), sl, font=body_font, fill="#666666")
+            y += line_h
+        y += gap
 
-        for line in lines:
-            draw.text((padding + 20, y), line, font=body_font, fill="#444444")
-            y += 30
-
-        if i < len(news_list):
+        # 分隔线
+        if i < len(summaries):
             draw.line([(padding, y), (width - padding, y)], fill="#EEEEEE", width=1)
-            y += 15
+            y += 8
 
     y += 10
     draw.text(
         (padding, y),
-        f"共 {len(news_list)} 条新闻 | 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"共 {len(summaries)} 条 | 摘要版 | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         font=footer_font, fill="#999999",
     )
 
